@@ -1,0 +1,2 @@
+com.github.dominikschlosser.keycloak.broker.oidc.CookielessOIDCIdentityProviderFactory
+com.github.dominikschlosser.keycloak.broker.saml.CookielessSAMLIdentityProviderFactory

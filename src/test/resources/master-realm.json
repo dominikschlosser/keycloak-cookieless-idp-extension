@@ -1,0 +1,26 @@
+{
+  "realm": "master",
+  "enabled": true,
+  "sslRequired": "none",
+  "users": [
+    {
+      "username": "admin",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "admin@localhost",
+      "firstName": "Admin",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["admin", "create-realm"],
+      "clientRoles": {
+        "master-realm": ["view-realm", "view-users", "manage-users", "manage-realm", "manage-clients", "manage-identity-providers", "manage-events"]
+      }
+    }
+  ]
+}
