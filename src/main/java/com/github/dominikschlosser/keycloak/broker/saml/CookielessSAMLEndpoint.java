@@ -11,7 +11,9 @@ import org.keycloak.broker.saml.SAMLIdentityProviderConfig;
 import org.keycloak.models.IdentityProviderModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
+import org.keycloak.models.UserModel;
 import org.keycloak.saml.validators.DestinationValidator;
+import org.keycloak.services.managers.AuthenticationSessionManager;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
 
@@ -95,15 +97,48 @@ public class CookielessSAMLEndpoint extends SAMLEndpoint {
                     }
 
                     if (foundSession != null) {
+                        // Check for step-up authentication (user ID present in state)
+                        String userIdShort = cookielessState.getUserId();
+                        UserModel authenticatedUser = foundSession.getAuthenticatedUser();
+                        String actualUserId = authenticatedUser != null ? authenticatedUser.getId() : null;
+
                         // Verify the HMAC to ensure the state wasn't tampered with
+                        // For step-up auth, include the user ID in verification
                         if (CookielessIdentityBrokerState.verifySAMLHmac(
-                                cookielessState, foundClientDbId, tabId, hmacKey)) {
+                                cookielessState, foundClientDbId, tabId, actualUserId, hmacKey)) {
+
+                            // If step-up state, verify the user ID hash matches
+                            if (userIdShort != null) {
+                                if (actualUserId == null) {
+                                    logger.warnf("Cookieless SAML: Step-up state but no authenticated user on session");
+                                } else if (!CookielessIdentityBrokerState.matchesUserIdShort(
+                                        actualUserId, userIdShort)) {
+                                    logger.warnf(
+                                            "Cookieless SAML: User ID mismatch for step-up auth. "
+                                                    + "Expected hash=%s, actual user=%s",
+                                            userIdShort, actualUserId);
+                                    return delegate.getAndVerifyAuthenticationSession(encodedCode);
+                                } else {
+                                    logger.debugf(
+                                            "Cookieless SAML: Step-up auth verified for user %s",
+                                            authenticatedUser.getUsername());
+                                }
+                            }
+
                             logger.debugf(
                                     "Cookieless SAML: Found and verified authentication session. "
-                                            + "sessionId=%s, clientId=%s, tabId=%s",
+                                            + "sessionId=%s, clientId=%s, tabId=%s, stepUp=%s",
                                     cookielessState.getSessionId(),
                                     foundSession.getClient().getClientId(),
-                                    tabId);
+                                    tabId,
+                                    userIdShort != null);
+
+                            // Set the AUTH_SESSION_ID cookie so subsequent requests can find the session
+                            // This is critical for the first-broker-login flow to work
+                            AuthenticationSessionManager authSessionManager = new AuthenticationSessionManager(session);
+                            authSessionManager.setAuthSessionCookie(
+                                    foundSession.getParentSession().getId());
+
                             return foundSession;
                         } else {
                             logger.warnf(

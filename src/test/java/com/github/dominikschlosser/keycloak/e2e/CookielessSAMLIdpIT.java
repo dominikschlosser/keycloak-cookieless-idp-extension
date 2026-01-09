@@ -60,7 +60,8 @@ public class CookielessSAMLIdpIT {
         String baseUrlForKeycloak = "http://host.testcontainers.internal:" + MOCK_SAML_PORT;
         mockSAMLServer = new MockSAMLServer(MOCK_SAML_PORT, baseUrlForKeycloak);
         mockSAMLServer.start();
-        System.out.println("Mock SAML server started on port " + MOCK_SAML_PORT + " with base URL " + baseUrlForKeycloak);
+        System.out.println(
+                "Mock SAML server started on port " + MOCK_SAML_PORT + " with base URL " + baseUrlForKeycloak);
 
         // Expose the host port so Docker containers can access it
         Testcontainers.exposeHostPorts(MOCK_SAML_PORT);
@@ -301,7 +302,9 @@ public class CookielessSAMLIdpIT {
         //
         // Without our extension, this would fail with "identity_provider_missing_state" error
         assertThat(callbackResponse.statusCode())
-                .as("Cookieless SAML callback must redirect to continue auth flow (got %d)", callbackResponse.statusCode())
+                .as(
+                        "Cookieless SAML callback must redirect to continue auth flow (got %d)",
+                        callbackResponse.statusCode())
                 .isIn(302, 303);
 
         String nextLocation = callbackResponse.header("Location");
@@ -313,12 +316,79 @@ public class CookielessSAMLIdpIT {
                 .doesNotContain("identity_provider_missing_state")
                 .doesNotContain("identity_provider_error");
 
-        // The redirect should be to continue the flow (first-broker-login or client callback)
-        assertThat(nextLocation)
-                .as("Should redirect within Keycloak or to client callback")
-                .satisfiesAnyOf(
-                        loc -> assertThat(loc).contains("/realms/" + REALM_NAME),
-                        loc -> assertThat(loc).contains("localhost:8080/callback"));
+        // ============================================================
+        // Complete login flow - may go directly to client or via first-broker-login
+        // ============================================================
+        Map<String, String> sessionCookies = callbackResponse.cookies();
+        String finalRedirectUrl = nextLocation;
+
+        // Follow redirects until we reach the client callback with authorization code
+        // This handles both direct redirect (auto-linking) and first-broker-login flow
+        int maxRedirects = 10;
+        while (maxRedirects-- > 0
+                && finalRedirectUrl != null
+                && !finalRedirectUrl.contains("localhost:8080/callback")) {
+            System.out.println("Following redirect to: " + finalRedirectUrl);
+            Response response = given().config(RestAssured.config()
+                            .redirect(RedirectConfig.redirectConfig().followRedirects(false)))
+                    .cookies(sessionCookies)
+                    .when()
+                    .get(finalRedirectUrl);
+
+            if (response.statusCode() == 200 && finalRedirectUrl.contains("first-broker-login")) {
+                // Need to submit the profile form
+                String formAction = extractFormAction(response.body().asString());
+                System.out.println("Submitting first-broker-login form to: " + formAction);
+
+                Response formResponse = given().config(RestAssured.config()
+                                .redirect(RedirectConfig.redirectConfig().followRedirects(false)))
+                        .cookies(sessionCookies)
+                        .contentType("application/x-www-form-urlencoded")
+                        .formParam("username", "mock-saml-user")
+                        .formParam("email", "mockuser@example.com")
+                        .formParam("firstName", "Mock")
+                        .formParam("lastName", "User")
+                        .when()
+                        .post(formAction);
+
+                finalRedirectUrl = formResponse.header("Location");
+                sessionCookies = new HashMap<>(sessionCookies);
+                sessionCookies.putAll(formResponse.cookies());
+            } else if (response.statusCode() == 302 || response.statusCode() == 303) {
+                finalRedirectUrl = response.header("Location");
+                sessionCookies = new HashMap<>(sessionCookies);
+                sessionCookies.putAll(response.cookies());
+            } else {
+                System.out.println("Unexpected response status: " + response.statusCode());
+                System.out.println("Response body: "
+                        + response.body()
+                                .asString()
+                                .substring(
+                                        0,
+                                        Math.min(500, response.body().asString().length())));
+                break;
+            }
+        }
+
+        System.out.println("Final redirect URL: " + finalRedirectUrl);
+
+        // ============================================================
+        // CRITICAL ASSERTION: User should be logged in with auth code
+        // ============================================================
+        assertThat(finalRedirectUrl)
+                .as("User should be redirected to client callback with authorization code")
+                .contains("localhost:8080/callback")
+                .contains("code=");
+
+        // Extract and verify the authorization code is present
+        String authCode = extractQueryParam(finalRedirectUrl, "code");
+        assertThat(authCode)
+                .as("Authorization code should be present")
+                .isNotNull()
+                .isNotEmpty();
+
+        System.out.println("SUCCESS: User logged in via cookieless SAML IDP, received auth code: "
+                + authCode.substring(0, Math.min(20, authCode.length())) + "...");
     }
 
     /**
@@ -391,6 +461,62 @@ public class CookielessSAMLIdpIT {
                 .as("Should not redirect to error page")
                 .doesNotContain("identity_provider_missing_state")
                 .doesNotContain("identity_provider_error");
+
+        // Complete the login flow and verify user gets auth code
+        Map<String, String> sessionCookies = new HashMap<>(allCookies);
+        sessionCookies.putAll(callbackResponse.cookies());
+
+        // Follow redirects through first-broker-login
+        String currentUrl = nextLocation;
+        int maxRedirects = 10;
+
+        while (maxRedirects-- > 0 && currentUrl != null && !currentUrl.contains("localhost:8080/callback")) {
+            Response response = given().config(RestAssured.config()
+                            .redirect(RedirectConfig.redirectConfig().followRedirects(false)))
+                    .cookies(sessionCookies)
+                    .when()
+                    .get(currentUrl);
+
+            if (response.statusCode() == 200 && currentUrl.contains("first-broker-login")) {
+                // Submit the profile form
+                String formAction = extractFormAction(response.body().asString());
+                Response formResponse = given().config(RestAssured.config()
+                                .redirect(RedirectConfig.redirectConfig().followRedirects(false)))
+                        .cookies(sessionCookies)
+                        .contentType("application/x-www-form-urlencoded")
+                        .formParam("username", "mock-saml-user-standard")
+                        .formParam("email", "mockuser-standard@example.com")
+                        .formParam("firstName", "Mock")
+                        .formParam("lastName", "User")
+                        .when()
+                        .post(formAction);
+
+                currentUrl = formResponse.header("Location");
+                sessionCookies.putAll(formResponse.cookies());
+            } else if (response.statusCode() == 302 || response.statusCode() == 303) {
+                currentUrl = response.header("Location");
+                sessionCookies.putAll(response.cookies());
+            } else {
+                break;
+            }
+        }
+
+        System.out.println("Standard SAML flow final URL: " + currentUrl);
+
+        // Verify user is logged in with auth code
+        assertThat(currentUrl)
+                .as("Standard flow: User should receive authorization code")
+                .contains("localhost:8080/callback")
+                .contains("code=");
+
+        String authCode = extractQueryParam(currentUrl, "code");
+        assertThat(authCode)
+                .as("Authorization code should be present")
+                .isNotNull()
+                .isNotEmpty();
+
+        System.out.println("SUCCESS: Standard SAML flow completed, received auth code: "
+                + authCode.substring(0, Math.min(20, authCode.length())) + "...");
     }
 
     private String createMockSAMLResponse(String inResponseTo) {
@@ -491,13 +617,26 @@ public class CookielessSAMLIdpIT {
         return null;
     }
 
+    private String extractFormAction(String html) {
+        // Simple regex to extract form action
+        Pattern pattern = Pattern.compile("action=\"([^\"]+)\"");
+        Matcher matcher = pattern.matcher(html);
+        if (matcher.find()) {
+            String action = matcher.group(1);
+            // Decode HTML entities
+            return action.replace("&amp;", "&");
+        }
+        return null;
+    }
+
     /**
      * Extracts the AuthnRequest ID from a SAML redirect-binding SAMLRequest parameter.
      * The SAMLRequest is DEFLATE compressed then Base64 encoded.
      */
     private String extractAuthnRequestId(String samlRequest) {
         try {
-            System.out.println("SAMLRequest (first 100 chars): " + samlRequest.substring(0, Math.min(100, samlRequest.length())));
+            System.out.println(
+                    "SAMLRequest (first 100 chars): " + samlRequest.substring(0, Math.min(100, samlRequest.length())));
             // The SAMLRequest is Base64 encoded (standard, not URL-safe)
             // Replace any URL-encoded + that became spaces
             String cleanedSamlRequest = samlRequest.replace(" ", "+");
@@ -514,7 +653,8 @@ public class CookielessSAMLIdpIT {
                 baos.write(buffer, 0, len);
             }
             String authnRequest = baos.toString(StandardCharsets.UTF_8);
-            System.out.println("Decoded AuthnRequest: " + authnRequest.substring(0, Math.min(500, authnRequest.length())));
+            System.out.println(
+                    "Decoded AuthnRequest: " + authnRequest.substring(0, Math.min(500, authnRequest.length())));
 
             // Extract the ID attribute using regex
             Pattern pattern = Pattern.compile("ID=\"([^\"]+)\"");

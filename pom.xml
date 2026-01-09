@@ -38,7 +38,7 @@
     <docker.api.version>1.44</docker.api.version>
 
     <keycloak.version>26.5.0</keycloak.version>
-    <testcontainers.version>1.19.8</testcontainers.version>
+    <testcontainers.version>2.0.2</testcontainers.version>
     <junit.version>5.10.2</junit.version>
     <slf4j.version>2.0.12</slf4j.version>
     <rest-assured.version>5.4.0</rest-assured.version>
@@ -46,17 +46,18 @@
 
   <dependencyManagement>
     <dependencies>
-      <dependency>
-        <groupId>org.keycloak</groupId>
-        <artifactId>keycloak-parent</artifactId>
-        <version>${keycloak.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
+      <!-- Testcontainers BOM MUST come before Keycloak to override its version -->
       <dependency>
         <groupId>org.testcontainers</groupId>
         <artifactId>testcontainers-bom</artifactId>
         <version>${testcontainers.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.keycloak</groupId>
+        <artifactId>keycloak-parent</artifactId>
+        <version>${keycloak.version}</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>

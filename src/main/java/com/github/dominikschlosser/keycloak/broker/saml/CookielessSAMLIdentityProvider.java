@@ -11,6 +11,7 @@ import org.keycloak.broker.saml.SAMLIdentityProviderConfig;
 import org.keycloak.events.EventBuilder;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
+import org.keycloak.models.UserModel;
 import org.keycloak.saml.validators.DestinationValidator;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
@@ -67,11 +68,20 @@ public class CookielessSAMLIdentityProvider extends SAMLIdentityProvider {
                 code = "default"; // Fallback code
             }
 
+            // Check if user is already authenticated (step-up scenario)
+            // Include user ID in state for session restoration on cookieless callback
+            UserModel authenticatedUser = authSession.getAuthenticatedUser();
+            String userId = authenticatedUser != null ? authenticatedUser.getId() : null;
+            if (userId != null) {
+                logger.debugf("Step-up authentication detected, including user ID in SAML state: %s", userId);
+            }
+
             CookielessIdentityBrokerState cookielessState = CookielessIdentityBrokerState.encodeSAML(
                     rootSession.getId(),
                     code,
                     authSession.getTabId(),
                     authSession.getClient().getId(),
+                    userId, // Include user ID for step-up auth
                     hmacKey);
 
             // Store the cookieless state in auth session so we can retrieve it in callback

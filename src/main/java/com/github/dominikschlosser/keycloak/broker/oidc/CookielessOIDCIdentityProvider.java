@@ -21,7 +21,9 @@ import org.keycloak.models.ClientModel;
 import org.keycloak.models.Constants;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
+import org.keycloak.models.UserModel;
 import org.keycloak.services.ErrorPage;
+import org.keycloak.services.managers.AuthenticationSessionManager;
 import org.keycloak.services.messages.Messages;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
@@ -61,6 +63,14 @@ public class CookielessOIDCIdentityProvider extends OIDCIdentityProvider {
         byte[] hmacKey = CookielessIdentityBrokerState.getHmacKey(
                 session, session.getContext().getRealm());
 
+        // Check if user is already authenticated (step-up scenario)
+        // Include user ID in state for session restoration on cookieless callback
+        UserModel authenticatedUser = authSession.getAuthenticatedUser();
+        String userId = authenticatedUser != null ? authenticatedUser.getId() : null;
+        if (userId != null) {
+            logger.debugf("Step-up authentication detected, including user ID in state: %s", userId);
+        }
+
         CookielessIdentityBrokerState cookielessState = CookielessIdentityBrokerState.encodeOIDC(
                 rootSession.getId(),
                 request.getState().getDecodedState(),
@@ -68,6 +78,7 @@ public class CookielessOIDCIdentityProvider extends OIDCIdentityProvider {
                 authSession.getClient().getId(),
                 authSession.getClient().getClientId(),
                 null, // clientData not used for OIDC (no size limit)
+                userId, // Include user ID for step-up auth
                 hmacKey);
 
         // Replace the state parameter
@@ -130,6 +141,27 @@ public class CookielessOIDCIdentityProvider extends OIDCIdentityProvider {
                 }
 
                 session.getContext().setAuthenticationSession(authSession);
+
+                // Set the AUTH_SESSION_ID cookie so subsequent requests can find the session
+                // This is critical for the first-broker-login flow to work
+                AuthenticationSessionManager authSessionManager = new AuthenticationSessionManager(session);
+                authSessionManager.setAuthSessionCookie(
+                        authSession.getParentSession().getId());
+
+                // Restore authenticated user for step-up authentication
+                // If user ID was encoded in state, this is a re-authentication scenario
+                String userId = cookielessState.getUserId();
+                if (userId != null) {
+                    UserModel user = session.users().getUserById(realm, userId);
+                    if (user != null) {
+                        logger.debugf(
+                                "Cookieless OIDC callback: restoring authenticated user for step-up auth: %s",
+                                user.getUsername());
+                        authSession.setAuthenticatedUser(user);
+                    } else {
+                        logger.warnf("Cookieless OIDC callback: user ID from state not found in realm: %s", userId);
+                    }
+                }
 
                 // Handle errors from the IDP
                 if (error != null) {

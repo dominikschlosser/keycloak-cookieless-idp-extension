@@ -35,6 +35,7 @@ public class MockOIDCServer implements AutoCloseable {
     private String lastReceivedState;
     private String lastReceivedRedirectUri;
     private String lastReceivedNonce;
+    private String userIdSuffix = "";
 
     public MockOIDCServer(int port) throws IOException {
         this(port, "http://localhost:" + port);
@@ -146,16 +147,20 @@ public class MockOIDCServer implements AutoCloseable {
                         .formatted(UUID.randomUUID().toString(), idToken);
 
         System.out.println("Mock OIDC Server: Sending token response with ID token");
-        System.out.println("Mock OIDC Server: ID token (first 200 chars): " + idToken.substring(0, Math.min(200, idToken.length())));
+        System.out.println("Mock OIDC Server: ID token (first 200 chars): "
+                + idToken.substring(0, Math.min(200, idToken.length())));
         sendJsonResponse(exchange, 200, tokenResponse);
     }
 
     private void handleJwks(HttpExchange exchange) throws IOException {
         RSAPublicKey publicKey = (RSAPublicKey) keyPair.getPublic();
         String n = Base64.getUrlEncoder().withoutPadding().encodeToString(toUnsignedByteArray(publicKey.getModulus()));
-        String e = Base64.getUrlEncoder().withoutPadding().encodeToString(toUnsignedByteArray(publicKey.getPublicExponent()));
+        String e = Base64.getUrlEncoder()
+                .withoutPadding()
+                .encodeToString(toUnsignedByteArray(publicKey.getPublicExponent()));
 
-        String jwks = """
+        String jwks =
+                """
             {
                 "keys": [{
                     "kty": "RSA",
@@ -166,7 +171,8 @@ public class MockOIDCServer implements AutoCloseable {
                     "e": "%s"
                 }]
             }
-            """.formatted(keyId, n, e);
+            """
+                        .formatted(keyId, n, e);
         sendJsonResponse(exchange, 200, jwks);
     }
 
@@ -199,27 +205,41 @@ public class MockOIDCServer implements AutoCloseable {
             // Create a signed JWT with RS256
             String header = Base64.getUrlEncoder()
                     .withoutPadding()
-                    .encodeToString(("{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"" + keyId + "\"}").getBytes(StandardCharsets.UTF_8));
+                    .encodeToString(("{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"" + keyId + "\"}")
+                            .getBytes(StandardCharsets.UTF_8));
 
             long now = Instant.now().getEpochSecond();
-            String nonceField = lastReceivedNonce != null ? ",\n                    \"nonce\": \"" + lastReceivedNonce + "\"" : "";
+            String nonceField =
+                    lastReceivedNonce != null ? ",\n                    \"nonce\": \"" + lastReceivedNonce + "\"" : "";
+            // Include amr (Authentication Methods References) to indicate IDP authentication
+            // Also include acr (Authentication Context Class Reference) for step-up verification
+            // And a custom claim idp_authenticated to make verification easier
+            // Use userIdSuffix to create unique users per test to avoid conflicts
+            String userId = "mock-user-123" + userIdSuffix;
+            String username = "mockuser" + userIdSuffix;
+            String email = userIdSuffix.isEmpty() ? "mock@example.com" : "mock" + userIdSuffix + "@example.com";
             String payloadJson =
                     """
                 {
                     "iss": "%s",
-                    "sub": "mock-user-123",
+                    "sub": "%s",
                     "aud": "mock-client",
                     "exp": %d,
                     "iat": %d,
                     "name": "Mock User",
-                    "email": "mock@example.com",
-                    "preferred_username": "mockuser"%s
+                    "email": "%s",
+                    "preferred_username": "%s",
+                    "amr": ["mfa", "external_idp"],
+                    "acr": "urn:mace:incommon:iap:silver",
+                    "idp_authenticated": true,
+                    "auth_time": %d%s
                 }
                 """
-                            .formatted(issuer, now + 3600, now, nonceField);
+                            .formatted(issuer, userId, now + 3600, now, email, username, now, nonceField);
 
-            String encodedPayload =
-                    Base64.getUrlEncoder().withoutPadding().encodeToString(payloadJson.getBytes(StandardCharsets.UTF_8));
+            String encodedPayload = Base64.getUrlEncoder()
+                    .withoutPadding()
+                    .encodeToString(payloadJson.getBytes(StandardCharsets.UTF_8));
 
             // Sign the token
             String dataToSign = header + "." + encodedPayload;
@@ -295,5 +315,13 @@ public class MockOIDCServer implements AutoCloseable {
      */
     public void setNonce(String nonce) {
         this.lastReceivedNonce = nonce;
+    }
+
+    /**
+     * Sets a suffix to add to user IDs to create unique users per test.
+     * Use this to avoid IDP user conflicts between tests.
+     */
+    public void setUserIdSuffix(String suffix) {
+        this.userIdSuffix = suffix != null ? suffix : "";
     }
 }
