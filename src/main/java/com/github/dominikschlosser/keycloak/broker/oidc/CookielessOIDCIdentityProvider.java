@@ -174,7 +174,7 @@ public class CookielessOIDCIdentityProvider extends OIDCIdentityProvider {
                 // Extract federated identity from token response
                 BrokeredIdentityContext federatedIdentity = provider.getFederatedIdentity(response);
 
-                if (providerConfig.isStoreToken()) {
+                if (Boolean.TRUE.equals(providerConfig.isStoreToken())) {
                     if (federatedIdentity.getToken() == null) {
                         federatedIdentity.setToken(response);
                     }

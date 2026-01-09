@@ -93,39 +93,34 @@ public class CookielessIdentityBrokerState {
     }
 
     /**
-     * Encode state for SAML (compact binary format, fits in 80 bytes). Format:
-     * [sessionId:16][hmac:8][clientId:16][tabId:4][code:8] = 52 bytes → 70 chars Base64
+     * Encode state for SAML RelayState. Uses a compact string format to fit within 80 bytes.
+     *
+     * <p>Format: sessionId.clientIdShort.tabId.hmac
+     *
+     * <p>Where:
+     * <ul>
+     *   <li>sessionId: The actual session ID string (URL-safe, ~24 chars)
+     *   <li>clientIdShort: First 4 bytes of SHA256(clientDbId), Base64Url (6 chars)
+     *   <li>tabId: The actual tab ID string (~11 chars) - allows direct session lookup
+     *   <li>hmac: First 8 bytes of HMAC(sessionId+clientDbId+tabId), Base64Url (11 chars)
+     * </ul>
+     *
+     * <p>Total: ~24 + 1 + 6 + 1 + 11 + 1 + 11 = ~55 chars, within 80 byte limit.
      */
     public static CookielessIdentityBrokerState encodeSAML(
             String sessionId, String code, String tabId, String clientDbId, byte[] hmacKey) {
 
-        ByteBuffer buffer = ByteBuffer.allocate(52);
+        // Client ID short hash (4 bytes -> 6 chars Base64Url)
+        byte[] clientIdHash = sha256(clientDbId.getBytes(StandardCharsets.UTF_8));
+        String clientIdShort = Base64Url.encode(Arrays.copyOf(clientIdHash, 4));
 
-        // Session ID as UUID bytes (16 bytes)
-        UUID sessionUuid = UUID.fromString(sessionId);
-        buffer.putLong(sessionUuid.getMostSignificantBits());
-        buffer.putLong(sessionUuid.getLeastSignificantBits());
+        // HMAC of all data (8 bytes -> 11 chars Base64Url)
+        byte[] hmac = computeHmac(sessionId + clientDbId + tabId, hmacKey);
+        String hmacShort = Base64Url.encode(Arrays.copyOf(hmac, HMAC_TRUNCATED_LENGTH));
 
-        // HMAC of all data (8 bytes truncated)
-        byte[] hmac = computeHmac(sessionId + clientDbId + tabId + code, hmacKey);
-        buffer.put(Arrays.copyOf(hmac, HMAC_TRUNCATED_LENGTH));
-
-        // Client ID as UUID bytes (16 bytes)
-        UUID clientUuid = UUID.fromString(clientDbId);
-        buffer.putLong(clientUuid.getMostSignificantBits());
-        buffer.putLong(clientUuid.getLeastSignificantBits());
-
-        // TabId - hash first 4 bytes (4 bytes)
-        byte[] tabIdHash = sha256(tabId.getBytes(StandardCharsets.UTF_8));
-        buffer.put(Arrays.copyOf(tabIdHash, 4));
-
-        // Code - first 8 bytes of decoded code or hash (8 bytes)
-        byte[] codeBytes = code.length() > 10
-                ? Arrays.copyOf(sha256(code.getBytes(StandardCharsets.UTF_8)), 8)
-                : Arrays.copyOf(Base64Url.decode(code), 8);
-        buffer.put(codeBytes);
-
-        String encoded = Base64Url.encode(buffer.array());
+        // Build encoded state: sessionId.clientIdShort.tabId.hmac
+        // Using actual tabId allows O(1) direct lookup instead of iteration
+        String encoded = sessionId + "." + clientIdShort + "." + tabId + "." + hmacShort;
 
         return new CookielessIdentityBrokerState(sessionId, code, tabId, clientDbId, null, encoded);
     }
@@ -156,47 +151,64 @@ public class CookielessIdentityBrokerState {
         return new CookielessIdentityBrokerState(sessionId, code, tabId, clientId, clientData, encodedState);
     }
 
-    /** Decode SAML RelayState (compact binary format). */
+    /**
+     * Decode SAML RelayState.
+     *
+     * <p>Format: sessionId.clientIdShort.tabId.hmac
+     *
+     * <p>Returns the session ID and actual tabId for direct O(1) lookup. The clientIdShort is a
+     * hash prefix used for verification after lookup.
+     */
     public static CookielessIdentityBrokerState decodeSAML(String encodedState, byte[] hmacKey) {
         if (encodedState == null || encodedState.isEmpty()) {
             throw new IllegalArgumentException("Encoded state is null or empty");
         }
 
-        byte[] data = Base64Url.decode(encodedState);
-        if (data.length != 52) {
-            throw new IllegalArgumentException("Invalid SAML state length: " + data.length);
+        String[] parts = DOT.split(encodedState, 4);
+        if (parts.length != 4) {
+            throw new IllegalArgumentException("Invalid SAML state format: expected 4 parts, got " + parts.length);
         }
 
-        ByteBuffer buffer = ByteBuffer.wrap(data);
+        String sessionId = parts[0];
+        String clientIdShort = parts[1];
+        String tabId = parts[2]; // Actual tabId, not a hash
+        String hmacShort = parts[3];
 
-        // Session ID (16 bytes)
-        long sessionMsb = buffer.getLong();
-        long sessionLsb = buffer.getLong();
-        String sessionId = new UUID(sessionMsb, sessionLsb).toString();
+        // Return decoded state with actual tabId for direct lookup
+        // clientIdShort is stored in the clientId field for later verification
+        return new CookielessIdentityBrokerState(sessionId, null, tabId, clientIdShort, null, encodedState);
+    }
 
-        // HMAC (8 bytes) - stored for verification
-        byte[] storedHmac = new byte[HMAC_TRUNCATED_LENGTH];
-        buffer.get(storedHmac);
+    /**
+     * Verify that the HMAC in a decoded SAML state matches the expected value.
+     *
+     * @param decodedState The decoded state from decodeSAML
+     * @param clientDbId The actual client database ID found from the auth session
+     * @param tabId The actual tab ID found from the auth session
+     * @param hmacKey The HMAC key for verification
+     * @return true if the HMAC is valid
+     */
+    public static boolean verifySAMLHmac(
+            CookielessIdentityBrokerState decodedState, String clientDbId, String tabId, byte[] hmacKey) {
+        String sessionId = decodedState.getSessionId();
+        String[] parts = DOT.split(decodedState.getEncoded(), 4);
+        String storedHmac = parts[3];
 
-        // Client ID (16 bytes)
-        long clientMsb = buffer.getLong();
-        long clientLsb = buffer.getLong();
-        String clientId = new UUID(clientMsb, clientLsb).toString();
+        // Recompute HMAC
+        byte[] expectedHmac = computeHmac(sessionId + clientDbId + tabId, hmacKey);
+        String expectedHmacShort = Base64Url.encode(Arrays.copyOf(expectedHmac, HMAC_TRUNCATED_LENGTH));
 
-        // TabId hash (4 bytes) - we store this for matching, not the original tabId
-        byte[] tabIdHash = new byte[4];
-        buffer.get(tabIdHash);
+        return MessageDigest.isEqual(
+                storedHmac.getBytes(StandardCharsets.UTF_8), expectedHmacShort.getBytes(StandardCharsets.UTF_8));
+    }
 
-        // Code (8 bytes) - truncated, used for matching
-        byte[] codeBytes = new byte[8];
-        buffer.get(codeBytes);
-
-        // For SAML, we return special markers for tabId and code since we only have hashes
-        // The actual verification will be done differently
-        String tabIdMarker = Base64Url.encode(tabIdHash);
-        String codeMarker = Base64Url.encode(codeBytes);
-
-        return new CookielessIdentityBrokerState(sessionId, codeMarker, tabIdMarker, clientId, null, encodedState);
+    /**
+     * Check if a client ID matches the short hash stored in the SAML state.
+     */
+    public static boolean matchesClientIdShort(String clientDbId, String clientIdShort) {
+        byte[] hash = sha256(clientDbId.getBytes(StandardCharsets.UTF_8));
+        String computed = Base64Url.encode(Arrays.copyOf(hash, 4));
+        return computed.equals(clientIdShort);
     }
 
     private static String signSessionId(String sessionId, byte[] hmacKey) {

@@ -2,30 +2,15 @@ package com.github.dominikschlosser.keycloak.broker.saml;
 
 import com.github.dominikschlosser.keycloak.broker.CookielessIdentityBrokerState;
 import jakarta.ws.rs.core.Response;
-import jakarta.ws.rs.core.UriInfo;
-import java.util.Iterator;
-import java.util.LinkedList;
-import java.util.List;
+import java.nio.charset.StandardCharsets;
 import org.jboss.logging.Logger;
 import org.keycloak.broker.provider.AuthenticationRequest;
 import org.keycloak.broker.provider.IdentityBrokerException;
 import org.keycloak.broker.saml.SAMLIdentityProvider;
 import org.keycloak.broker.saml.SAMLIdentityProviderConfig;
-import org.keycloak.dom.saml.v2.protocol.AuthnRequestType;
 import org.keycloak.events.EventBuilder;
-import org.keycloak.models.KeyManager;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
-import org.keycloak.protocol.saml.JaxrsSAML2BindingBuilder;
-import org.keycloak.protocol.saml.SamlSessionUtils;
-import org.keycloak.protocol.saml.preprocessor.SamlAuthenticationPreprocessor;
-import org.keycloak.saml.SAML2AuthnRequestBuilder;
-import org.keycloak.saml.SAML2NameIDPolicyBuilder;
-import org.keycloak.saml.SAML2RequestedAuthnContextBuilder;
-import org.keycloak.saml.SignatureAlgorithm;
-import org.keycloak.saml.common.constants.JBossSAMLURIConstants;
-import org.keycloak.saml.processing.api.saml.v2.request.SAML2Request;
-import org.keycloak.saml.processing.core.util.KeycloakKeySamlExtensionGenerator;
 import org.keycloak.saml.validators.DestinationValidator;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
@@ -68,165 +53,64 @@ public class CookielessSAMLIdentityProvider extends SAMLIdentityProvider {
     @Override
     public Response performLogin(AuthenticationRequest request) {
         try {
-            UriInfo uriInfo = request.getUriInfo();
             RealmModel realm = request.getRealm();
             AuthenticationSessionModel authSession = request.getAuthenticationSession();
             RootAuthenticationSessionModel rootSession = authSession.getParentSession();
 
             // Create cookieless RelayState with session ID
+            // We need to store the session info before the parent builds the SAML request
             byte[] hmacKey = CookielessIdentityBrokerState.getHmacKey(session, realm);
+
+            // Get the code from the state - the parent's state contains the verification code
+            String code = request.getState().getDecodedState();
+            if (code == null || code.isEmpty()) {
+                code = "default"; // Fallback code
+            }
+
             CookielessIdentityBrokerState cookielessState = CookielessIdentityBrokerState.encodeSAML(
                     rootSession.getId(),
-                    request.getState().getDecodedState(),
+                    code,
                     authSession.getTabId(),
                     authSession.getClient().getId(),
                     hmacKey);
 
-            String issuerURL = getEntityId(uriInfo, realm);
-            String destinationUrl = getConfig().getSingleSignOnServiceUrl();
-            String nameIDPolicyFormat = getConfig().getNameIDPolicyFormat();
+            // Store the cookieless state in auth session so we can retrieve it in callback
+            authSession.setAuthNote("cookieless_relay_state", cookielessState.getEncoded());
 
-            if (nameIDPolicyFormat == null) {
-                nameIDPolicyFormat = JBossSAMLURIConstants.NAMEID_FORMAT_PERSISTENT.get();
-            }
+            // Call parent's performLogin which will build and send the SAML AuthnRequest
+            // The parent will use its own RelayState, but we'll extract it from the redirect
+            Response parentResponse = super.performLogin(request);
 
-            String protocolBinding = JBossSAMLURIConstants.SAML_HTTP_REDIRECT_BINDING.get();
-            String assertionConsumerServiceUrl = request.getRedirectUri();
-
-            if (getConfig().isArtifactBindingResponse()) {
-                protocolBinding = JBossSAMLURIConstants.SAML_HTTP_ARTIFACT_BINDING.get();
-            } else if (getConfig().isPostBindingResponse()) {
-                protocolBinding = JBossSAMLURIConstants.SAML_HTTP_POST_BINDING.get();
-            }
-
-            SAML2RequestedAuthnContextBuilder requestedAuthnContext = new SAML2RequestedAuthnContextBuilder()
-                    .setComparison(getConfig().getAuthnContextComparisonType());
-
-            for (String authnContextClassRef : getAuthnContextClassRefUris()) {
-                requestedAuthnContext.addAuthnContextClassRef(authnContextClassRef);
-            }
-
-            for (String authnContextDeclRef : getAuthnContextDeclRefUris()) {
-                requestedAuthnContext.addAuthnContextDeclRef(authnContextDeclRef);
-            }
-
-            Integer attributeConsumingServiceIndex = getConfig().getAttributeConsumingServiceIndex();
-            String loginHint = getConfig().isLoginHint()
-                    ? authSession.getClientNote(org.keycloak.protocol.oidc.OIDCLoginProtocol.LOGIN_HINT_PARAM)
-                    : null;
-
-            Boolean allowCreate = null;
-            if (getConfig().getConfig().get(SAMLIdentityProviderConfig.ALLOW_CREATE) != null) {
-                allowCreate = Boolean.valueOf(getConfig().getConfig().get(SAMLIdentityProviderConfig.ALLOW_CREATE));
-            }
-
-            SAML2AuthnRequestBuilder authnRequestBuilder = new SAML2AuthnRequestBuilder()
-                    .assertionConsumerUrl(assertionConsumerServiceUrl)
-                    .destination(destinationUrl)
-                    .issuer(issuerURL)
-                    .forceAuthn(getConfig().isForceAuthn())
-                    .protocolBinding(protocolBinding)
-                    .nameIdPolicy(
-                            SAML2NameIDPolicyBuilder.format(nameIDPolicyFormat).setAllowCreate(allowCreate))
-                    .attributeConsumingServiceIndex(attributeConsumingServiceIndex)
-                    .requestedAuthnContext(requestedAuthnContext)
-                    .subject(loginHint);
-
-            JaxrsSAML2BindingBuilder binding = new JaxrsSAML2BindingBuilder(session)
-                    .relayState(cookielessState.getEncoded()); // Use our cookieless state as
-            // RelayState
-
-            boolean postBinding = getConfig().isPostBindingAuthnRequest();
-
-            if (getConfig().isWantAuthnRequestsSigned()) {
-                KeyManager.ActiveRsaKey keys = session.keys().getActiveRsaKey(realm);
-
-                String keyName = getConfig()
-                        .getXmlSigKeyInfoKeyNameTransformer()
-                        .getKeyName(keys.getKid(), keys.getCertificate());
-                binding.signWith(keyName, keys.getPrivateKey(), keys.getPublicKey(), keys.getCertificate())
-                        .signatureAlgorithm(getSignatureAlgorithm())
-                        .signDocument();
-                if (!postBinding && getConfig().isAddExtensionsElementWithKeyInfo()) {
-                    authnRequestBuilder.addExtension(new KeycloakKeySamlExtensionGenerator(keyName));
+            // If the response is a redirect, we need to replace the RelayState
+            if (parentResponse.getStatus() == 302 || parentResponse.getStatus() == 303) {
+                Object locationObj = parentResponse.getMetadata().getFirst("Location");
+                String location = locationObj != null ? locationObj.toString() : null;
+                if (location != null && location.contains("RelayState=")) {
+                    // Replace the RelayState parameter with our cookieless state
+                    location = replaceRelayState(location, cookielessState.getEncoded());
+                    return Response.status(parentResponse.getStatus())
+                            .header("Location", location)
+                            .build();
                 }
             }
 
-            AuthnRequestType authnRequest = authnRequestBuilder.createAuthnRequest();
-            for (Iterator<SamlAuthenticationPreprocessor> it =
-                            SamlSessionUtils.getSamlAuthenticationPreprocessorIterator(session);
-                    it.hasNext(); ) {
-                authnRequest = it.next().beforeSendingLoginRequest(authnRequest, authSession);
-            }
-
-            if (authnRequest.getDestination() != null) {
-                destinationUrl = authnRequest.getDestination().toString();
-            }
-
-            // Save the request ID in auth session for later validation
-            authSession.setClientNote(
-                    org.keycloak.protocol.saml.SamlProtocol.SAML_REQUEST_ID_BROKER, authnRequest.getID());
-
-            if (postBinding) {
-                return binding.postBinding(SAML2Request.convert(authnRequest)).request(destinationUrl);
-            } else {
-                return binding.redirectBinding(SAML2Request.convert(authnRequest))
-                        .request(destinationUrl);
-            }
-
+            return parentResponse;
         } catch (Exception e) {
+            logger.error("Failed to perform SAML login", e);
             throw new IdentityBrokerException("Could not create authentication request.", e);
         }
     }
 
-    @Override
-    public SignatureAlgorithm getSignatureAlgorithm() {
-        String alg = getConfig().getSignatureAlgorithm();
-        if (alg != null) {
-            return SignatureAlgorithm.valueOf(alg);
+    private String replaceRelayState(String url, String newRelayState) {
+        // URL-encode the new relay state
+        String encodedRelayState;
+        try {
+            encodedRelayState = java.net.URLEncoder.encode(newRelayState, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            encodedRelayState = newRelayState;
         }
-        return SignatureAlgorithm.RSA_SHA256;
-    }
 
-    private List<String> getAuthnContextClassRefUris() {
-        String authnContextClassRefs = getConfig().getAuthnContextClassRefs();
-        if (authnContextClassRefs == null || authnContextClassRefs.isEmpty()) {
-            return new LinkedList<>();
-        }
-        List<String> result = new LinkedList<>();
-        for (String ref : authnContextClassRefs.split(",")) {
-            ref = ref.trim();
-            if (!ref.isEmpty()) {
-                result.add(ref);
-            }
-        }
-        return result;
-    }
-
-    private List<String> getAuthnContextDeclRefUris() {
-        String authnContextDeclRefs = getConfig().getAuthnContextDeclRefs();
-        if (authnContextDeclRefs == null || authnContextDeclRefs.isEmpty()) {
-            return new LinkedList<>();
-        }
-        List<String> result = new LinkedList<>();
-        for (String ref : authnContextDeclRefs.split(",")) {
-            ref = ref.trim();
-            if (!ref.isEmpty()) {
-                result.add(ref);
-            }
-        }
-        return result;
-    }
-
-    public String getEntityId(UriInfo uriInfo, RealmModel realm) {
-        String configEntityId = getConfig().getEntityId();
-        if (configEntityId == null || configEntityId.isEmpty()) {
-            return uriInfo.getBaseUriBuilder()
-                    .path("realms")
-                    .path(realm.getName())
-                    .build()
-                    .toString();
-        }
-        return configEntityId;
+        // Replace existing RelayState parameter
+        return url.replaceFirst("RelayState=[^&]*", "RelayState=" + encodedRelayState);
     }
 }

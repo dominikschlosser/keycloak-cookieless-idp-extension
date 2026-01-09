@@ -8,7 +8,6 @@ import org.keycloak.broker.provider.UserAuthenticationIdentityProvider;
 import org.keycloak.broker.saml.SAMLEndpoint;
 import org.keycloak.broker.saml.SAMLIdentityProvider;
 import org.keycloak.broker.saml.SAMLIdentityProviderConfig;
-import org.keycloak.models.ClientModel;
 import org.keycloak.models.IdentityProviderModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
@@ -67,37 +66,50 @@ public class CookielessSAMLEndpoint extends SAMLEndpoint {
                 CookielessIdentityBrokerState cookielessState =
                         CookielessIdentityBrokerState.decodeSAML(encodedCode, hmacKey);
 
-                // Look up the session directly by ID
+                // Look up the root session directly by ID - O(1)
                 RootAuthenticationSessionModel rootSession = session.authenticationSessions()
                         .getRootAuthenticationSession(realm, cookielessState.getSessionId());
 
                 if (rootSession != null) {
-                    // For SAML compact encoding, clientId is the DB ID (UUID), not the clientId
-                    // string
-                    ClientModel client = realm.getClientById(cookielessState.getClientId());
-                    if (client == null) {
-                        logger.debugf("Client not found by ID: %s", cookielessState.getClientId());
-                        // Fall back to delegate
-                        return delegate.getAndVerifyAuthenticationSession(encodedCode);
-                    }
+                    String clientIdShort = cookielessState.getClientId(); // Short hash of client DB ID
+                    String tabId = cookielessState.getTabId(); // Actual tabId for direct lookup
 
-                    // TabId is hashed in SAML compact encoding, so we need to find the right tab
-                    // For now, try to get any authentication session for this client
-                    // In production, you might want to iterate through tabs to find the right one
-                    AuthenticationSessionModel authSession = null;
-                    for (var tab : rootSession.getAuthenticationSessions().values()) {
-                        if (tab.getClient().getId().equals(client.getId())) {
-                            authSession = tab;
-                            break;
+                    // Find the matching client by iterating (still needed since we only have clientIdShort)
+                    // This is O(n) where n is number of tabs (typically 1-5), not number of users
+                    AuthenticationSessionModel foundSession = null;
+                    String foundClientDbId = null;
+
+                    for (var entry : rootSession.getAuthenticationSessions().entrySet()) {
+                        AuthenticationSessionModel authSession = entry.getValue();
+                        String clientDbId = authSession.getClient().getId();
+
+                        // Check if this client matches our short hash
+                        if (CookielessIdentityBrokerState.matchesClientIdShort(clientDbId, clientIdShort)) {
+                            // Use direct O(1) lookup by tabId
+                            foundSession = rootSession.getAuthenticationSession(authSession.getClient(), tabId);
+                            if (foundSession != null) {
+                                foundClientDbId = clientDbId;
+                                break;
+                            }
                         }
                     }
 
-                    if (authSession != null) {
-                        logger.debugf(
-                                "Cookieless SAML: Found authentication session via state parameter. "
-                                        + "sessionId=%s, clientId=%s",
-                                cookielessState.getSessionId(), client.getClientId());
-                        return authSession;
+                    if (foundSession != null) {
+                        // Verify the HMAC to ensure the state wasn't tampered with
+                        if (CookielessIdentityBrokerState.verifySAMLHmac(
+                                cookielessState, foundClientDbId, tabId, hmacKey)) {
+                            logger.debugf(
+                                    "Cookieless SAML: Found and verified authentication session. "
+                                            + "sessionId=%s, clientId=%s, tabId=%s",
+                                    cookielessState.getSessionId(),
+                                    foundSession.getClient().getClientId(),
+                                    tabId);
+                            return foundSession;
+                        } else {
+                            logger.warnf(
+                                    "Cookieless SAML: HMAC verification failed for sessionId=%s",
+                                    cookielessState.getSessionId());
+                        }
                     }
                 }
             } catch (Exception e) {

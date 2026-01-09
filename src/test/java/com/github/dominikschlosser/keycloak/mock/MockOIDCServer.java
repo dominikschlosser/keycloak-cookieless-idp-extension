@@ -4,10 +4,15 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.Signature;
+import java.security.interfaces.RSAPublicKey;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.HashMap;
@@ -24,17 +29,36 @@ public class MockOIDCServer implements AutoCloseable {
     private final HttpServer server;
     private final int port;
     private final String issuer;
+    private final KeyPair keyPair;
+    private final String keyId;
 
     private String lastReceivedState;
     private String lastReceivedRedirectUri;
+    private String lastReceivedNonce;
 
     public MockOIDCServer(int port) throws IOException {
+        this(port, "http://localhost:" + port);
+    }
+
+    public MockOIDCServer(int port, String issuer) throws IOException {
         this.port = port;
-        this.issuer = "http://localhost:" + port;
+        this.issuer = issuer;
         this.server = HttpServer.create(new InetSocketAddress(port), 0);
         this.server.setExecutor(Executors.newFixedThreadPool(2));
+        this.keyPair = generateKeyPair();
+        this.keyId = "test-key-1";
 
         setupEndpoints();
+    }
+
+    private KeyPair generateKeyPair() {
+        try {
+            KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
+            keyGen.initialize(2048);
+            return keyGen.generateKeyPair();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to generate RSA key pair", e);
+        }
     }
 
     private void setupEndpoints() {
@@ -77,10 +101,12 @@ public class MockOIDCServer implements AutoCloseable {
     }
 
     private void handleAuthorize(HttpExchange exchange) throws IOException {
+        System.out.println("Mock OIDC Server: Received authorize request: " + exchange.getRequestURI());
         Map<String, String> params = parseQueryParams(exchange.getRequestURI().getQuery());
 
         lastReceivedState = params.get("state");
         lastReceivedRedirectUri = params.get("redirect_uri");
+        lastReceivedNonce = params.get("nonce");
 
         // Generate an authorization code
         String code = UUID.randomUUID().toString();
@@ -99,8 +125,10 @@ public class MockOIDCServer implements AutoCloseable {
     }
 
     private void handleToken(HttpExchange exchange) throws IOException {
+        System.out.println("Mock OIDC Server: Received token request");
         // Read and parse request body
         String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        System.out.println("Mock OIDC Server: Token request body: " + body);
         Map<String, String> params = parseFormParams(body);
 
         // Create a simple unsigned ID token (for testing only)
@@ -117,17 +145,40 @@ public class MockOIDCServer implements AutoCloseable {
             """
                         .formatted(UUID.randomUUID().toString(), idToken);
 
+        System.out.println("Mock OIDC Server: Sending token response with ID token");
+        System.out.println("Mock OIDC Server: ID token (first 200 chars): " + idToken.substring(0, Math.min(200, idToken.length())));
         sendJsonResponse(exchange, 200, tokenResponse);
     }
 
     private void handleJwks(HttpExchange exchange) throws IOException {
-        // Empty JWKS - we use unsigned tokens for testing
+        RSAPublicKey publicKey = (RSAPublicKey) keyPair.getPublic();
+        String n = Base64.getUrlEncoder().withoutPadding().encodeToString(toUnsignedByteArray(publicKey.getModulus()));
+        String e = Base64.getUrlEncoder().withoutPadding().encodeToString(toUnsignedByteArray(publicKey.getPublicExponent()));
+
         String jwks = """
             {
-                "keys": []
+                "keys": [{
+                    "kty": "RSA",
+                    "use": "sig",
+                    "kid": "%s",
+                    "alg": "RS256",
+                    "n": "%s",
+                    "e": "%s"
+                }]
             }
-            """;
+            """.formatted(keyId, n, e);
         sendJsonResponse(exchange, 200, jwks);
+    }
+
+    private byte[] toUnsignedByteArray(BigInteger bigInt) {
+        byte[] bytes = bigInt.toByteArray();
+        // Remove leading zero byte if present (used for sign in Java's BigInteger)
+        if (bytes[0] == 0 && bytes.length > 1) {
+            byte[] tmp = new byte[bytes.length - 1];
+            System.arraycopy(bytes, 1, tmp, 0, tmp.length);
+            return tmp;
+        }
+        return bytes;
     }
 
     private void handleUserInfo(HttpExchange exchange) throws IOException {
@@ -144,32 +195,44 @@ public class MockOIDCServer implements AutoCloseable {
     }
 
     private String createMockIdToken() {
-        // Create an unsigned JWT (alg: none) for testing
-        String header = Base64.getUrlEncoder()
-                .withoutPadding()
-                .encodeToString("{\"alg\":\"none\",\"typ\":\"JWT\"}".getBytes(StandardCharsets.UTF_8));
+        try {
+            // Create a signed JWT with RS256
+            String header = Base64.getUrlEncoder()
+                    .withoutPadding()
+                    .encodeToString(("{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"" + keyId + "\"}").getBytes(StandardCharsets.UTF_8));
 
-        long now = Instant.now().getEpochSecond();
-        String payload =
+            long now = Instant.now().getEpochSecond();
+            String nonceField = lastReceivedNonce != null ? ",\n                    \"nonce\": \"" + lastReceivedNonce + "\"" : "";
+            String payloadJson =
+                    """
+                {
+                    "iss": "%s",
+                    "sub": "mock-user-123",
+                    "aud": "mock-client",
+                    "exp": %d,
+                    "iat": %d,
+                    "name": "Mock User",
+                    "email": "mock@example.com",
+                    "preferred_username": "mockuser"%s
+                }
                 """
-            {
-                "iss": "%s",
-                "sub": "mock-user-123",
-                "aud": "mock-client",
-                "exp": %d,
-                "iat": %d,
-                "name": "Mock User",
-                "email": "mock@example.com",
-                "preferred_username": "mockuser"
-            }
-            """
-                        .formatted(issuer, now + 3600, now);
+                            .formatted(issuer, now + 3600, now, nonceField);
 
-        String encodedPayload =
-                Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes(StandardCharsets.UTF_8));
+            String encodedPayload =
+                    Base64.getUrlEncoder().withoutPadding().encodeToString(payloadJson.getBytes(StandardCharsets.UTF_8));
 
-        // Unsigned token (alg: none) - signature part is empty
-        return header + "." + encodedPayload + ".";
+            // Sign the token
+            String dataToSign = header + "." + encodedPayload;
+            Signature signature = Signature.getInstance("SHA256withRSA");
+            signature.initSign(keyPair.getPrivate());
+            signature.update(dataToSign.getBytes(StandardCharsets.UTF_8));
+            byte[] signatureBytes = signature.sign();
+            String encodedSignature = Base64.getUrlEncoder().withoutPadding().encodeToString(signatureBytes);
+
+            return dataToSign + "." + encodedSignature;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create ID token", e);
+        }
     }
 
     private void sendJsonResponse(HttpExchange exchange, int statusCode, String json) throws IOException {
@@ -224,5 +287,13 @@ public class MockOIDCServer implements AutoCloseable {
 
     public String getLastReceivedRedirectUri() {
         return lastReceivedRedirectUri;
+    }
+
+    /**
+     * Sets the nonce that should be included in ID tokens.
+     * Use this when the test bypasses the authorize endpoint.
+     */
+    public void setNonce(String nonce) {
+        this.lastReceivedNonce = nonce;
     }
 }

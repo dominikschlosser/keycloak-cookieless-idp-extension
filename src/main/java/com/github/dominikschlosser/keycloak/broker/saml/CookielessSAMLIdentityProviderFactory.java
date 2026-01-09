@@ -33,12 +33,18 @@ public class CookielessSAMLIdentityProviderFactory extends SAMLIdentityProviderF
 
     @Override
     public CookielessSAMLIdentityProvider create(KeycloakSession session, IdentityProviderModel model) {
-        return new CookielessSAMLIdentityProvider(session, new SAMLIdentityProviderConfig(model), destinationValidator);
+        DestinationValidator validator = this.destinationValidator;
+        if (validator == null) {
+            // Create a default validator if init() wasn't called or config was missing
+            validator = DestinationValidator.forProtocolMap(null);
+        }
+        return new CookielessSAMLIdentityProvider(session, new SAMLIdentityProviderConfig(model), validator);
     }
 
     @Override
     public void init(Scope config) {
         super.init(config);
-        this.destinationValidator = DestinationValidator.forProtocolMap(config.getArray("knownProtocols"));
+        String[] knownProtocols = config.getArray("knownProtocols");
+        this.destinationValidator = DestinationValidator.forProtocolMap(knownProtocols);
     }
 }

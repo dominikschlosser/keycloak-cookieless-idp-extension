@@ -3,18 +3,24 @@ package com.github.dominikschlosser.keycloak.e2e;
 import static io.restassured.RestAssured.given;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.github.dominikschlosser.keycloak.mock.MockOIDCServer;
+import com.github.dominikschlosser.keycloak.mock.MockSAMLServer;
 import io.restassured.RestAssured;
 import io.restassured.config.RedirectConfig;
 import io.restassured.response.Response;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Base64;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.zip.Inflater;
+import java.util.zip.InflaterInputStream;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -30,34 +36,34 @@ import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
 /**
- * End-to-end integration test for the Cookieless OIDC Identity Provider.
+ * End-to-end integration test for the Cookieless SAML Identity Provider.
  *
- * <p>This test verifies that the IDP broker flow works correctly even when the callback from the
- * external IDP arrives without cookies (simulating a scenario where the external IDP opened a
+ * <p>This test verifies that the SAML IDP broker flow works correctly even when the callback from
+ * the external IDP arrives without cookies (simulating a scenario where the external IDP opened a
  * native app that returned in a new browser instance).
  */
-public class CookielessOIDCIdpIT {
+public class CookielessSAMLIdpIT {
 
     private static final String REALM_NAME = "test-realm";
     private static final String CLIENT_ID = "test-client";
-    private static final String IDP_ALIAS = "cookieless-oidc-idp";
-    private static final int MOCK_OIDC_PORT = 8888;
+    private static final String IDP_ALIAS = "cookieless-saml-idp";
+    private static final int MOCK_SAML_PORT = 8889;
 
-    private static MockOIDCServer mockOIDCServer;
+    private static MockSAMLServer mockSAMLServer;
     private static String keycloakBaseUrl;
     private static GenericContainer<?> keycloak;
 
     @BeforeAll
     static void setup() throws Exception {
-        // Start mock OIDC server on the host with issuer that matches what Keycloak will see
+        // Start mock SAML server on the host with base URL that matches what Keycloak will see
         // Keycloak runs in Docker and accesses the host via host.testcontainers.internal
-        String issuerForKeycloak = "http://host.testcontainers.internal:" + MOCK_OIDC_PORT;
-        mockOIDCServer = new MockOIDCServer(MOCK_OIDC_PORT, issuerForKeycloak);
-        mockOIDCServer.start();
-        System.out.println("Mock OIDC server started on port " + MOCK_OIDC_PORT + " with issuer " + issuerForKeycloak);
+        String baseUrlForKeycloak = "http://host.testcontainers.internal:" + MOCK_SAML_PORT;
+        mockSAMLServer = new MockSAMLServer(MOCK_SAML_PORT, baseUrlForKeycloak);
+        mockSAMLServer.start();
+        System.out.println("Mock SAML server started on port " + MOCK_SAML_PORT + " with base URL " + baseUrlForKeycloak);
 
         // Expose the host port so Docker containers can access it
-        Testcontainers.exposeHostPorts(MOCK_OIDC_PORT);
+        Testcontainers.exposeHostPorts(MOCK_SAML_PORT);
 
         // Build and start Keycloak container
         File jarFile = new File("target/keycloak-cookieless-idp-extension-1.0.0-SNAPSHOT.jar");
@@ -104,8 +110,8 @@ public class CookielessOIDCIdpIT {
 
     @AfterAll
     static void teardown() {
-        if (mockOIDCServer != null) {
-            mockOIDCServer.close();
+        if (mockSAMLServer != null) {
+            mockSAMLServer.close();
         }
         if (keycloak != null) {
             keycloak.stop();
@@ -136,15 +142,15 @@ public class CookielessOIDCIdpIT {
             client.setEnabled(true);
             client.setDirectAccessGrantsEnabled(true);
             client.setPublicClient(true);
-            client.setRedirectUris(List.of("http://localhost:8080/callback", "*"));
-            client.setWebOrigins(List.of("*"));
+            client.setRedirectUris(java.util.List.of("http://localhost:8080/callback", "*"));
+            client.setWebOrigins(java.util.List.of("*"));
             adminClient.realm(REALM_NAME).clients().create(client);
             System.out.println("Created client: " + CLIENT_ID);
 
-            // Create cookieless OIDC identity provider
+            // Create cookieless SAML identity provider
             IdentityProviderRepresentation idp = new IdentityProviderRepresentation();
             idp.setAlias(IDP_ALIAS);
-            idp.setProviderId("cookieless-oidc"); // Our custom provider ID
+            idp.setProviderId("cookieless-saml"); // Our custom provider ID
             idp.setEnabled(true);
             idp.setTrustEmail(true);
             idp.setFirstBrokerLoginFlowAlias("first broker login");
@@ -153,14 +159,13 @@ public class CookielessOIDCIdpIT {
             // Using host.testcontainers.internal for Docker-for-Mac/Windows
             String mockServerHost = "host.testcontainers.internal";
             Map<String, String> config = new HashMap<>();
-            config.put("authorizationUrl", "http://" + mockServerHost + ":" + MOCK_OIDC_PORT + "/authorize");
-            config.put("tokenUrl", "http://" + mockServerHost + ":" + MOCK_OIDC_PORT + "/token");
-            config.put("jwksUrl", "http://" + mockServerHost + ":" + MOCK_OIDC_PORT + "/jwks");
-            config.put("clientId", "mock-client");
-            config.put("clientSecret", "mock-secret");
-            config.put("defaultScope", "openid profile email");
-            config.put("validateSignature", "true");
-            config.put("useJwksUrl", "true");
+            config.put("singleSignOnServiceUrl", "http://" + mockServerHost + ":" + MOCK_SAML_PORT + "/sso");
+            config.put("nameIDPolicyFormat", "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified");
+            config.put("principalType", "SUBJECT");
+            config.put("postBindingAuthnRequest", "false"); // Use redirect binding
+            config.put("postBindingResponse", "true"); // Response comes via POST
+            config.put("validateSignature", "false"); // Mock server uses unsigned assertions
+            config.put("wantAuthnRequestsSigned", "false");
             idp.setConfig(config);
 
             adminClient.realm(REALM_NAME).identityProviders().create(idp);
@@ -173,22 +178,25 @@ public class CookielessOIDCIdpIT {
     }
 
     /**
-     * Tests the cookieless callback scenario.
+     * Tests the cookieless SAML callback scenario.
      *
-     * <p>This simulates a real-world flow where: 1. User starts login in their browser (cookies are
-     * set) 2. Keycloak redirects to external IDP 3. External IDP opens a native app for
-     * authentication 4. Native app completes auth and opens a NEW browser instance to return the
-     * callback 5. The new browser has NO cookies from the original session
+     * <p>This simulates a real-world flow where:
+     * <ol>
+     *   <li>User starts login in their browser (cookies are set)
+     *   <li>Keycloak redirects to external SAML IDP
+     *   <li>External IDP authenticates user (possibly via native app)
+     *   <li>IDP returns SAML Response to a NEW browser instance (no cookies)
+     * </ol>
      *
-     * <p>The cookieless extension embeds the session ID in the state parameter, allowing Keycloak
-     * to recover the session without relying on cookies.
+     * <p>The cookieless extension embeds the session ID in the RelayState parameter, allowing
+     * Keycloak to recover the session without relying on cookies.
      *
      * <p>Note: The initial steps still use cookies to establish the session and navigate through
      * Keycloak's internal redirects - this is the original browser. The key test is that the
      * CALLBACK works without cookies.
      */
     @Test
-    void testCookielessOIDCFlow() {
+    void testCookielessSAMLFlow() {
         // Step 1: Start the login flow in the "original browser"
         // Cookies are set here - this is normal browser behavior
         Response authStartResponse = given().config(RestAssured.config()
@@ -219,7 +227,7 @@ public class CookielessOIDCIdpIT {
 
         System.out.println("Broker login response status: " + brokerLoginResponse.statusCode());
 
-        // This should redirect to the external IDP's authorize endpoint
+        // This should redirect to the external SAML IDP's SSO endpoint
         assertThat(brokerLoginResponse.statusCode())
                 .as("Should redirect to external IDP")
                 .isIn(302, 303);
@@ -227,49 +235,53 @@ public class CookielessOIDCIdpIT {
         String idpRedirectUrl = brokerLoginResponse.header("Location");
         System.out.println("IDP redirect URL: " + idpRedirectUrl);
 
-        // Verify this goes to the mock OIDC server's authorize endpoint
+        // Verify this goes to the mock SAML server's SSO endpoint
         assertThat(idpRedirectUrl)
-                .as("Should redirect to mock OIDC authorize endpoint")
-                .contains("/authorize");
-        assertThat(idpRedirectUrl).contains("state=");
+                .as("Should redirect to mock SAML SSO endpoint")
+                .contains("/sso");
+        assertThat(idpRedirectUrl).contains("SAMLRequest=");
+        assertThat(idpRedirectUrl).contains("RelayState=");
 
-        // Extract state and nonce from redirect URL
-        String state = extractQueryParam(idpRedirectUrl, "state");
-        String nonce = extractQueryParam(idpRedirectUrl, "nonce");
-        System.out.println("State parameter (contains embedded session ID): " + state);
-        System.out.println("Nonce parameter: " + nonce);
-        assertThat(state).isNotNull();
-        assertThat(nonce).isNotNull();
+        // Extract RelayState from redirect URL - this contains the embedded session ID
+        String relayState = extractQueryParam(idpRedirectUrl, "RelayState");
+        System.out.println("RelayState parameter (contains embedded session ID): " + relayState);
+        assertThat(relayState).isNotNull();
 
-        // Set the nonce on the mock server so it includes it in the ID token
-        mockOIDCServer.setNonce(nonce);
+        // Extract SAMLRequest and get the AuthnRequest ID for InResponseTo
+        String samlRequest = extractQueryParam(idpRedirectUrl, "SAMLRequest");
+        String authnRequestId = extractAuthnRequestId(samlRequest);
+        System.out.println("AuthnRequest ID: " + authnRequestId);
+        assertThat(authnRequestId).isNotNull();
 
-        // Step 3: Simulate the external IDP authentication
+        // Step 3: Simulate the external SAML IDP authentication
         // In a real scenario, the external IDP would authenticate the user,
-        // possibly opening a native app, then redirect back to Keycloak
+        // possibly opening a native app, then POST a SAML Response back to Keycloak
         String callbackUrl = "/realms/" + REALM_NAME + "/broker/" + IDP_ALIAS + "/endpoint";
-        String mockAuthCode = "mock-auth-code-12345";
+
+        // Create a mock SAML Response (Base64 encoded) with correct InResponseTo
+        String samlResponse = createMockSAMLResponse(authnRequestId);
+        String encodedSamlResponse = Base64.getEncoder().encodeToString(samlResponse.getBytes(StandardCharsets.UTF_8));
 
         // ============================================================
         // CRITICAL: This is the cookieless callback test
         // ============================================================
-        // Step 4: Call Keycloak's broker callback endpoint WITHOUT cookies
+        // Step 4: POST SAML Response to Keycloak's broker callback endpoint WITHOUT cookies
         // This simulates a NEW browser instance (e.g., opened by native app)
         // that has no access to the original session cookies.
         //
-        // Without the cookieless extension, this would fail with
-        // "identity_provider_missing_state" error because Keycloak
-        // couldn't find the auth session without the AUTH_SESSION_ID cookie.
+        // Without the cookieless extension, this would fail with an error
+        // because Keycloak couldn't find the auth session without cookies.
         //
-        // With the extension, the session ID is extracted from the state
+        // With the extension, the session ID is extracted from the RelayState
         // parameter and the session is recovered directly.
         Response callbackResponse = given().config(RestAssured.config()
                         .redirect(RedirectConfig.redirectConfig().followRedirects(false)))
                 // NO COOKIES - simulating new browser instance
-                .queryParam("code", mockAuthCode)
-                .queryParam("state", state)
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("SAMLResponse", encodedSamlResponse)
+                .formParam("RelayState", relayState)
                 .when()
-                .get(callbackUrl);
+                .post(callbackUrl);
 
         System.out.println("Callback response status: " + callbackResponse.statusCode());
         System.out.println("Callback response headers: " + callbackResponse.headers());
@@ -277,19 +289,19 @@ public class CookielessOIDCIdpIT {
         if (callbackResponse.statusCode() != 302 && callbackResponse.statusCode() != 303) {
             System.out.println("Callback response body: " + callbackBody);
             // Print Keycloak container logs to diagnose the error
-            System.out.println("=== Keycloak Container Logs (last 100 lines) ===");
+            System.out.println("=== Keycloak Container Logs ===");
             System.out.println(keycloak.getLogs());
             System.out.println("=== End Keycloak Logs ===");
         }
 
-        // With cookieless IDP, this MUST redirect (302/303) to continue the auth flow
-        // After successful token exchange, Keycloak redirects to:
+        // With cookieless SAML IDP, this MUST redirect (302/303) to continue the auth flow
+        // After successful SAML assertion processing, Keycloak redirects to:
         // - First broker login page (new user needs to review/link account), or
         // - Directly to the client redirect_uri (if auto-linking is configured)
         //
         // Without our extension, this would fail with "identity_provider_missing_state" error
         assertThat(callbackResponse.statusCode())
-                .as("Cookieless callback must redirect to continue auth flow (got %d)", callbackResponse.statusCode())
+                .as("Cookieless SAML callback must redirect to continue auth flow (got %d)", callbackResponse.statusCode())
                 .isIn(302, 303);
 
         String nextLocation = callbackResponse.header("Location");
@@ -298,8 +310,8 @@ public class CookielessOIDCIdpIT {
         // Verify it's not an error redirect
         assertThat(nextLocation)
                 .as("Should not redirect to error page")
-                .doesNotContain("error=identity_provider_missing_state")
-                .doesNotContain("error=identity_provider_error");
+                .doesNotContain("identity_provider_missing_state")
+                .doesNotContain("identity_provider_error");
 
         // The redirect should be to continue the flow (first-broker-login or client callback)
         assertThat(nextLocation)
@@ -310,16 +322,13 @@ public class CookielessOIDCIdpIT {
     }
 
     /**
-     * Tests that the standard cookie-based flow still works with the extension.
+     * Tests that the standard cookie-based SAML flow still works with the extension.
      *
      * <p>This is a regression test to ensure the cookieless extension doesn't break the normal flow
      * where cookies ARE available (e.g., same browser instance throughout the entire flow).
-     *
-     * <p>The extension should work in both scenarios: - With cookies: Standard Keycloak behavior -
-     * Without cookies: Session recovered from state parameter
      */
     @Test
-    void testStandardFlowWithCookiesStillWorks() {
+    void testStandardSAMLFlowWithCookiesStillWorks() {
         // Standard flow: cookies are sent throughout the entire flow
         Response authStartResponse = given().config(RestAssured.config()
                         .redirect(RedirectConfig.redirectConfig().followRedirects(false)))
@@ -348,30 +357,33 @@ public class CookielessOIDCIdpIT {
         // Merge cookies from both responses into a new mutable map
         Map<String, String> allCookies = new HashMap<>(cookies);
         allCookies.putAll(brokerLoginResponse.cookies());
-        String state = extractQueryParam(idpRedirectUrl, "state");
-        String nonce = extractQueryParam(idpRedirectUrl, "nonce");
+        String relayState = extractQueryParam(idpRedirectUrl, "RelayState");
 
-        // Set the nonce on the mock server so it includes it in the ID token
-        mockOIDCServer.setNonce(nonce);
+        // Extract SAMLRequest and get the AuthnRequest ID for InResponseTo
+        String samlRequest = extractQueryParam(idpRedirectUrl, "SAMLRequest");
+        String authnRequestId = extractAuthnRequestId(samlRequest);
+
+        // Create a mock SAML Response with correct InResponseTo
+        String samlResponse = createMockSAMLResponse(authnRequestId);
+        String encodedSamlResponse = Base64.getEncoder().encodeToString(samlResponse.getBytes(StandardCharsets.UTF_8));
 
         // Callback WITH cookies - standard flow where browser keeps same session
-        // This is the normal case when user stays in the same browser
         String callbackUrl = "/realms/" + REALM_NAME + "/broker/" + IDP_ALIAS + "/endpoint";
-        String mockAuthCode = "mock-auth-code-67890";
 
         Response callbackResponse = given().config(RestAssured.config()
                         .redirect(RedirectConfig.redirectConfig().followRedirects(false)))
                 .cookies(allCookies) // Cookies included - same browser instance
-                .queryParam("code", mockAuthCode)
-                .queryParam("state", state)
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("SAMLResponse", encodedSamlResponse)
+                .formParam("RelayState", relayState)
                 .when()
-                .get(callbackUrl);
+                .post(callbackUrl);
 
-        System.out.println("Standard flow callback status: " + callbackResponse.statusCode());
+        System.out.println("Standard SAML flow callback status: " + callbackResponse.statusCode());
 
         // Must redirect to continue the auth flow
         assertThat(callbackResponse.statusCode())
-                .as("Standard flow callback must redirect")
+                .as("Standard SAML flow callback must redirect")
                 .isIn(302, 303);
 
         String nextLocation = callbackResponse.header("Location");
@@ -379,6 +391,86 @@ public class CookielessOIDCIdpIT {
                 .as("Should not redirect to error page")
                 .doesNotContain("identity_provider_missing_state")
                 .doesNotContain("identity_provider_error");
+    }
+
+    private String createMockSAMLResponse(String inResponseTo) {
+        String responseId = "_" + java.util.UUID.randomUUID().toString();
+        String assertionId = "_" + java.util.UUID.randomUUID().toString();
+        java.time.Instant now = java.time.Instant.now();
+        String issueInstant = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
+                .withZone(java.time.ZoneOffset.UTC)
+                .format(now);
+        String notOnOrAfter = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
+                .withZone(java.time.ZoneOffset.UTC)
+                .format(now.plusSeconds(300));
+        String notBefore = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
+                .withZone(java.time.ZoneOffset.UTC)
+                .format(now.minusSeconds(60));
+
+        String destination = keycloakBaseUrl + "/realms/" + REALM_NAME + "/broker/" + IDP_ALIAS + "/endpoint";
+        String audience = keycloakBaseUrl + "/realms/" + REALM_NAME;
+        String issuer = mockSAMLServer.getEntityId();
+
+        return """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                ID="%s"
+                                Version="2.0"
+                                IssueInstant="%s"
+                                Destination="%s"
+                                InResponseTo="%s">
+                    <saml:Issuer>%s</saml:Issuer>
+                    <samlp:Status>
+                        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+                    </samlp:Status>
+                    <saml:Assertion ID="%s"
+                                    Version="2.0"
+                                    IssueInstant="%s">
+                        <saml:Issuer>%s</saml:Issuer>
+                        <saml:Subject>
+                            <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified">mock-saml-user</saml:NameID>
+                            <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                                <saml:SubjectConfirmationData NotOnOrAfter="%s"
+                                                              Recipient="%s"
+                                                              InResponseTo="%s"/>
+                            </saml:SubjectConfirmation>
+                        </saml:Subject>
+                        <saml:Conditions NotBefore="%s" NotOnOrAfter="%s">
+                            <saml:AudienceRestriction>
+                                <saml:Audience>%s</saml:Audience>
+                            </saml:AudienceRestriction>
+                        </saml:Conditions>
+                        <saml:AuthnStatement AuthnInstant="%s" SessionIndex="%s">
+                            <saml:AuthnContext>
+                                <saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef>
+                            </saml:AuthnContext>
+                        </saml:AuthnStatement>
+                        <saml:AttributeStatement>
+                            <saml:Attribute Name="email">
+                                <saml:AttributeValue>mockuser@example.com</saml:AttributeValue>
+                            </saml:Attribute>
+                        </saml:AttributeStatement>
+                    </saml:Assertion>
+                </samlp:Response>
+                """
+                .formatted(
+                        responseId,
+                        issueInstant,
+                        destination,
+                        inResponseTo,
+                        issuer,
+                        assertionId,
+                        issueInstant,
+                        issuer,
+                        notOnOrAfter,
+                        destination,
+                        inResponseTo,
+                        notBefore,
+                        notOnOrAfter,
+                        audience,
+                        issueInstant,
+                        assertionId);
     }
 
     private String extractQueryParam(String url, String paramName) {
@@ -395,6 +487,43 @@ public class CookielessOIDCIdpIT {
             }
         } catch (Exception e) {
             // Ignore parsing errors
+        }
+        return null;
+    }
+
+    /**
+     * Extracts the AuthnRequest ID from a SAML redirect-binding SAMLRequest parameter.
+     * The SAMLRequest is DEFLATE compressed then Base64 encoded.
+     */
+    private String extractAuthnRequestId(String samlRequest) {
+        try {
+            System.out.println("SAMLRequest (first 100 chars): " + samlRequest.substring(0, Math.min(100, samlRequest.length())));
+            // The SAMLRequest is Base64 encoded (standard, not URL-safe)
+            // Replace any URL-encoded + that became spaces
+            String cleanedSamlRequest = samlRequest.replace(" ", "+");
+            byte[] decoded = Base64.getDecoder().decode(cleanedSamlRequest);
+
+            // Inflate (decompress DEFLATE)
+            Inflater inflater = new Inflater(true); // nowrap=true for raw DEFLATE
+            ByteArrayInputStream bais = new ByteArrayInputStream(decoded);
+            InflaterInputStream iis = new InflaterInputStream(bais, inflater);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buffer = new byte[1024];
+            int len;
+            while ((len = iis.read(buffer)) > 0) {
+                baos.write(buffer, 0, len);
+            }
+            String authnRequest = baos.toString(StandardCharsets.UTF_8);
+            System.out.println("Decoded AuthnRequest: " + authnRequest.substring(0, Math.min(500, authnRequest.length())));
+
+            // Extract the ID attribute using regex
+            Pattern pattern = Pattern.compile("ID=\"([^\"]+)\"");
+            Matcher matcher = pattern.matcher(authnRequest);
+            if (matcher.find()) {
+                return matcher.group(1);
+            }
+        } catch (Exception e) {
+            System.out.println("Failed to extract AuthnRequest ID: " + e.getMessage());
         }
         return null;
     }
